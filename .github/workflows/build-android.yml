@@ -8,18 +8,19 @@ permissions:
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout source and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           fetch-depth: 1
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -30,6 +31,8 @@ jobs:
       - name: Install Android dependencies
         shell: bash
         run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
@@ -42,41 +45,44 @@ jobs:
       - name: Patch Apple-only F_NOCACHE calls for Android
         shell: bash
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("llama.cpp-omni/src/llama-moe-slot.cpp")
           if not path.is_file():
-              raise SystemExit(f"Expected source file not found: {path}")
+              raise SystemExit(
+                  f"Required submodule source was not found: {path}"
+              )
 
           source = path.read_text(encoding="utf-8")
 
-          # Guard the F_NOCACHE loop in apply_experts_nocache().
-          fn_start = source.find(
-              "    void apply_experts_nocache(bool on) {"
+          # Disable the Apple-specific cache-control loop outside Apple builds.
+          start = source.find(
+              "void apply_experts_nocache(bool on) {"
           )
-          fd_start = source.find(
-              "    int fd_for(const std::string & path) {",
-              fn_start
+          end = source.find(
+              "int fd_for(const std::string & path) {", start
           )
 
-          if fn_start < 0 or fd_start < 0:
+          if start < 0 or end < 0:
               raise SystemExit(
-                  "Could not locate the expected MoE cache functions; "
-                  "source layout changed."
+                  "Could not locate apply_experts_nocache()/fd_for()."
               )
 
-          apply_block = source[fn_start:fd_start]
+          apply_block = source[start:end]
 
           if "fcntl(kv.second, F_NOCACHE, on ? 1 : 0)" not in apply_block:
               raise SystemExit(
-                  "Could not find the F_NOCACHE loop in "
-                  "apply_experts_nocache()."
+                  "Expected F_NOCACHE call in apply_experts_nocache() "
+                  "was not found."
               )
 
           if "#ifndef _WIN32" not in apply_block:
               raise SystemExit(
-                  "Could not find the expected platform guard."
+                  "Expected platform guard in apply_experts_nocache() "
+                  "was not found."
               )
 
           apply_block = apply_block.replace(
@@ -84,73 +90,88 @@ jobs:
               "#if defined(__APPLE__)",
               1
           )
+          source = source[:start] + apply_block + source[end:]
 
-          source = source[:fn_start] + apply_block + source[fd_start:]
-
-          # Guard the F_NOCACHE call in fd_for(), preserving open().
-          fn_start = source.find(
-              "    int fd_for(const std::string & path) {"
+          # Keep open() available on Android, but compile F_NOCACHE only
+          # on Apple platforms.
+          pattern = re.compile(
+              r'(?m)^(?P<i>[ \t]*)if \(experts_nocache_desired\(\) && '
+              r'fcntl\(fd, F_NOCACHE, 1\) != 0\) \{\n'
+              r'(?P=i)[ \t]*moe_log\("F_NOCACHE 设置失败: %s", '
+              r'std::strerror\(errno\)\);\n'
+              r'(?P=i)\}'
           )
-          next_fn = source.find(
-              "    // read one contiguous file span",
-              fn_start
-          )
 
-          if fn_start < 0 or next_fn < 0:
+          matches = list(pattern.finditer(source))
+          if len(matches) != 1:
               raise SystemExit(
-                  "Could not locate the end of fd_for(); "
-                  "source layout changed."
+                  "Expected exactly one F_NOCACHE call in fd_for(); "
+                  f"found {len(matches)}."
               )
 
-          fd_block = source[fn_start:next_fn]
-
-          marker = (
-              "        if (experts_nocache_desired() && "
-              "fcntl(fd, F_NOCACHE, 1) != 0) {"
-          )
-
-          if marker not in fd_block:
-              raise SystemExit(
-                  "Could not find the F_NOCACHE call in fd_for()."
+          def guard(match):
+              indent = match.group("i")
+              return (
+                  f"{indent}#if defined(__APPLE__)\n"
+                  f"{match.group(0)}\n"
+                  f"{indent}#endif"
               )
 
-          call_start = fd_block.index(marker)
-          call_close = fd_block.find("\n        }", call_start)
-
-          if call_close < 0:
-              raise SystemExit(
-                  "Could not find the closing brace for F_NOCACHE."
-              )
-
-          call_end = call_close + len("\n        }")
-          call_block = fd_block[call_start:call_end]
-
-          guarded_call = (
-              "#if defined(__APPLE__)\n"
-              + call_block
-              + "\n#endif"
-          )
-
-          fd_block = (
-              fd_block[:call_start]
-              + guarded_call
-              + fd_block[call_end:]
-          )
-
-          source = source[:fn_start] + fd_block + source[next_fn:]
-
+          source = pattern.sub(guard, source, count=1)
           path.write_text(source, encoding="utf-8")
-          print(f"Patched Apple-only F_NOCACHE calls in {path}")
+
+          # Confirm that both original calls still exist after patching.
+          check = path.read_text(encoding="utf-8")
+          if check.count(
+              "fcntl(kv.second, F_NOCACHE, on ? 1 : 0)"
+          ) != 1:
+              raise SystemExit("Patch verification failed for cached fd.")
+
+          if check.count("fcntl(fd, F_NOCACHE, 1)") != 1:
+              raise SystemExit("Patch verification failed for new fd.")
+
+          print(
+              "Patch applied: Android will skip Apple-only F_NOCACHE calls."
+          )
           PY
 
-      - name: Build debug APK
+          echo "========== NATIVE SOURCE PATCH DIFF =========="
+          git diff -- llama.cpp-omni/src/llama-moe-slot.cpp || true
+          echo "========== END PATCH DIFF ===================="
+
+      - name: Build debug APK and print failure details
         working-directory: MiniCPM-V-demo-Android
         shell: bash
         run: |
+          set -uo pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon assembleDebug --stacktrace
+
+          set +e
+          ./gradlew --no-daemon assembleDebug \
+            --stacktrace --console=plain 2>&1 | tee ../build-debug.log
+          build_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$build_status" -ne 0 ]; then
+            echo "========== BUILD ERROR DETAILS =========="
+            grep -n -B 8 -A 15 -E \
+              'error:|fatal error:|FAILED:|What went wrong:|CMake Error|Could not find|Could not locate|No such file or directory|Execution failed' \
+              ../build-debug.log | tail -n 240 || true
+            echo "========== END BUILD ERROR DETAILS ======="
+            exit "$build_status"
+          fi
+
+      - name: Upload diagnostic build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniCPM-V-build-log
+          path: build-debug.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MiniCPM-V-Android-APK
