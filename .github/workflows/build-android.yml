@@ -9,30 +9,29 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
       - name: Checkout source and submodules
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Set up Java
-        uses: actions/setup-java@v6
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
 
       - name: Install Android dependencies
+        shell: bash
         run: |
           sdkmanager --install \
+            "platform-tools" \
             "platforms;android-35" \
             "platforms;android-36" \
             "build-tools;35.0.0" \
@@ -40,18 +39,118 @@ jobs:
             "ndk;27.0.12077973" \
             "cmake;3.22.1"
 
-      - name: Verify Android SDK
+      - name: Patch Apple-only F_NOCACHE calls for Android
+        shell: bash
         run: |
-          java --version
-          sdkmanager --list_installed
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Build APK
+          path = Path("llama.cpp-omni/src/llama-moe-slot.cpp")
+          if not path.is_file():
+              raise SystemExit(f"Expected source file not found: {path}")
+
+          source = path.read_text(encoding="utf-8")
+
+          # Guard the F_NOCACHE loop in apply_experts_nocache().
+          fn_start = source.find(
+              "    void apply_experts_nocache(bool on) {"
+          )
+          fd_start = source.find(
+              "    int fd_for(const std::string & path) {",
+              fn_start
+          )
+
+          if fn_start < 0 or fd_start < 0:
+              raise SystemExit(
+                  "Could not locate the expected MoE cache functions; "
+                  "source layout changed."
+              )
+
+          apply_block = source[fn_start:fd_start]
+
+          if "fcntl(kv.second, F_NOCACHE, on ? 1 : 0)" not in apply_block:
+              raise SystemExit(
+                  "Could not find the F_NOCACHE loop in "
+                  "apply_experts_nocache()."
+              )
+
+          if "#ifndef _WIN32" not in apply_block:
+              raise SystemExit(
+                  "Could not find the expected platform guard."
+              )
+
+          apply_block = apply_block.replace(
+              "#ifndef _WIN32",
+              "#if defined(__APPLE__)",
+              1
+          )
+
+          source = source[:fn_start] + apply_block + source[fd_start:]
+
+          # Guard the F_NOCACHE call in fd_for(), preserving open().
+          fn_start = source.find(
+              "    int fd_for(const std::string & path) {"
+          )
+          next_fn = source.find(
+              "    // read one contiguous file span",
+              fn_start
+          )
+
+          if fn_start < 0 or next_fn < 0:
+              raise SystemExit(
+                  "Could not locate the end of fd_for(); "
+                  "source layout changed."
+              )
+
+          fd_block = source[fn_start:next_fn]
+
+          marker = (
+              "        if (experts_nocache_desired() && "
+              "fcntl(fd, F_NOCACHE, 1) != 0) {"
+          )
+
+          if marker not in fd_block:
+              raise SystemExit(
+                  "Could not find the F_NOCACHE call in fd_for()."
+              )
+
+          call_start = fd_block.index(marker)
+          call_close = fd_block.find("\n        }", call_start)
+
+          if call_close < 0:
+              raise SystemExit(
+                  "Could not find the closing brace for F_NOCACHE."
+              )
+
+          call_end = call_close + len("\n        }")
+          call_block = fd_block[call_start:call_end]
+
+          guarded_call = (
+              "#if defined(__APPLE__)\n"
+              + call_block
+              + "\n#endif"
+          )
+
+          fd_block = (
+              fd_block[:call_start]
+              + guarded_call
+              + fd_block[call_end:]
+          )
+
+          source = source[:fn_start] + fd_block + source[next_fn:]
+
+          path.write_text(source, encoding="utf-8")
+          print(f"Patched Apple-only F_NOCACHE calls in {path}")
+          PY
+
+      - name: Build debug APK
         working-directory: MiniCPM-V-demo-Android
+        shell: bash
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug --stacktrace
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: MiniCPM-V-Android-APK
