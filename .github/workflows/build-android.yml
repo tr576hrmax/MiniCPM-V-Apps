@@ -26,18 +26,24 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: ''
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
       - name: Install Android dependencies
         run: |
           sdkmanager --install \
-            "platform-tools" \
             "platforms;android-35" \
             "platforms;android-36" \
             "build-tools;35.0.0" \
             "build-tools;36.0.0" \
             "ndk;27.0.12077973" \
             "cmake;3.22.1"
+
+      - name: Verify Android SDK
+        run: |
+          java --version
+          sdkmanager --list_installed
 
       - name: Build APK
         working-directory: MiniCPM-V-demo-Android
